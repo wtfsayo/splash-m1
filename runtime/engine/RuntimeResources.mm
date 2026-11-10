@@ -1529,10 +1529,10 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return milliseconds;
   };
-  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks, bool pairs) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled, pairs);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =

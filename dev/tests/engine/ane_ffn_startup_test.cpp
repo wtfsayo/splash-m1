@@ -97,7 +97,7 @@ struct Fake {
   std::function<Timings()> time = measured;
   // The split layer of full chunks by its units, the same at every count unless a test sets it.
   std::function<double(uint32_t)> split = [](uint32_t) { return 13.0; };
-  std::function<AneFfnPrepared(uint32_t, bool)> prepare = [](uint32_t, bool timed) {
+  std::function<AneFfnPrepared(uint32_t, bool, bool)> prepare = [](uint32_t, bool timed, bool) {
     AneFfnPrepared prepared;
     if (timed) prepared.chunks = timedChunks(15.5);
     prepared.error = 0.025;
@@ -111,6 +111,8 @@ struct Fake {
   // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
   uint32_t asked = 0, timings = 0;
   std::optional<std::pair<uint32_t, bool>> prepared;
+  // Whether each prepare() asked for a split of pairs.
+  std::vector<bool> pairsAsked;
   std::vector<uint32_t> splitsTimed;
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
@@ -141,9 +143,10 @@ struct Fake {
       splitsTimed.push_back(aneUnits);
       return split(aneUnits);
     };
-    result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
+    result.prepare = [this](uint32_t aneUnits, bool timeChunks, bool pairs) {
       prepared = {aneUnits, timeChunks};
-      return prepare(aneUnits, timeChunks);
+      pairsAsked.push_back(pairs);
+      return prepare(aneUnits, timeChunks, pairs);
     };
     result.recall = [this](uint32_t maxAneUnits) {
       recalled = maxAneUnits;
@@ -341,12 +344,12 @@ void testDeterministicContext() {
     timings.gpuAlone = 14.0;
     return timings;
   };
-  const auto slowChunks = [](uint32_t, bool) {
+  const auto slowChunks = [](uint32_t, bool, bool) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
   };
-  const auto fails = [](uint32_t, bool) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
+  const auto fails = [](uint32_t, bool, bool) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
   const Calibration nine{9, 700, {{{512, 5.0}, {2048, 20.0}}}};
   const uint32_t most = Fake{}.largestSplitContext();
   require(most && most < contextWith(Fake{}.bytes(1)), "the largest split holds no less context");
@@ -488,7 +491,7 @@ void testFailures() {
               has(started.log, " with --disable-ane). --disable-ane silences this line."),
           "a timing that failed did not warn: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [](uint32_t, bool, bool) -> AneFfnPrepared {
     throw std::runtime_error("ANE FFN split of 640 rows failed (the Neural Engine's output or its scales were not "
                              "finite)");
   };
@@ -497,22 +500,22 @@ void testFailures() {
               has(started.log, "unavailable (ANE FFN split of 640 rows failed"),
           "a split that failed verify() was not unavailable");
   // Chunks that were not timed are not read.
-  fake.prepare = [](uint32_t, bool) { return AneFfnPrepared{}; };
+  fake.prepare = [](uint32_t, bool, bool) { return AneFfnPrepared{}; };
   started = start(fake);
   require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan && !fake.remembered &&
               has(started.log, "unavailable (the split's chunks were not timed)"),
           "a split of no chunks timed was not unavailable: " + started.log);
 
   bool cancelled = false;
-  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, bool, bool) -> AneFfnPrepared {
     cancelled = true;
     throw std::runtime_error("the Metal command was not submitted");
   };
   rejects([&] { static_cast<void>(start(fake, {}, {}, [&] { return cancelled; })); }, "not submitted",
           "a cancelled start went on");
-  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
+  fake.prepare = [](uint32_t, bool, bool) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
   rejects([&] { static_cast<void>(start(fake)); }, "interrupted", "an interrupted wait went on");
-  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, bool, bool) -> AneFfnPrepared {
     fake.healthy = false;
     throw std::runtime_error("the backend stopped serving");
   };
@@ -536,7 +539,7 @@ void testACommandOutOfMemoryIsCommandMemory() {
         return metal::MetalBackendError("Metal command 2 failed: Insufficient Memory", outOfMemory);
       };
       if (setup)
-        fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared { throw failed(); };
+        fake.prepare = [&](uint32_t, bool, bool) -> AneFfnPrepared { throw failed(); };
       else
         fake.time = [&]() -> Timings { throw failed(); };
       const std::string what = std::string(setup ? "setup" : "calibration") + "'s command that failed " +
@@ -594,7 +597,7 @@ void testNoGain() {
                                "2048-row FFN layer by enough (calibrated in "),
           "a share predicted to gain too little split: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool) {
+  fake.prepare = [](uint32_t, bool, bool) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
@@ -674,6 +677,30 @@ void testGivenShare() {
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
   require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
           "the given least chunk did not run as given: " + started.log);
+  // A given split has slots for pairs; a calibrated one, whose share was timed on single chunks, has one.
+  require(fake.pairsAsked == std::vector<bool>{true, true}, "a given split was not prepared for pairs");
+  Fake calibrating;
+  static_cast<void>(start(calibrating));
+  require(calibrating.pairsAsked == std::vector<bool>{false}, "a calibrated split was prepared for pairs");
+  // A split that cannot give a pair its slots serves single chunks at the given share, and says so.
+  Fake single;
+  single.prepare = [](uint32_t, bool, bool pairs) -> AneFfnPrepared {
+    if (pairs) throw std::runtime_error("ANE FFN second slot failed");
+    AneFfnPrepared prepared;
+    prepared.error = 0.025;
+    return prepared;
+  };
+  started = start(single, {.given = AneFfnSetting::Given{0.2}});
+  require(started.start.outcome.kind == Kind::Split && single.pairsAsked == std::vector<bool>{true, false} &&
+              has(started.log, "Warning · Neural Engine FFN split cannot run a command as a pair of chunks (ANE FFN "
+                               "second slot failed); its chunks run one at a time."),
+          "a split without pairs did not serve single chunks: " + started.log);
+  // A split that fails either way is unavailable, as before.
+  Fake neither;
+  neither.prepare = [](uint32_t, bool, bool) -> AneFfnPrepared { throw std::runtime_error("ANE FFN failed"); };
+  started = start(neither, {.given = AneFfnSetting::Given{0.2}});
+  require(started.start.outcome.kind == Kind::Unavailable && neither.pairsAsked == std::vector<bool>{true, false},
+          "a split that failed with and without pairs was not unavailable: " + started.log);
   for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0},
                                            AneFfnSetting::Given{0.2, ops::AneFfn::kMinimumRows - 1},
                                            AneFfnSetting::Given{0.2, 2049}})

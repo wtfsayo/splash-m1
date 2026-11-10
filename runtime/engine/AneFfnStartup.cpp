@@ -186,7 +186,18 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   };
   try {
     if (given) {
-      AneFfnPrepared prepared = model.prepare(*given, false);
+      // A split that cannot give a pair its slots still serves single chunks.
+      AneFfnPrepared prepared;
+      try {
+        prepared = model.prepare(*given, false, true);
+      } catch (const ane::Interrupted &) {
+        throw;
+      } catch (const std::exception &error) {
+        if ((cancelled && cancelled()) || !model.healthy()) throw;
+        logWarning("Neural Engine FFN split cannot run a command as a pair of chunks (", error.what(),
+                   "); its chunks run one at a time.");
+        prepared = model.prepare(*given, false, false);
+      }
       if (prepared.split) prepared.split->setMinimumRows(setting.given->minimumRows);
       return serve(std::move(prepared), *given, setting.given->minimumRows, "", "set up");
     }
@@ -216,7 +227,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
         return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false, false);
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -231,7 +242,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     // The fit's units, or a neighbour's that their timings show faster.
     const uint32_t chosen = ane_ffn::refine(
         *fitted, maxAneUnits, [&](uint32_t aneUnits) { return model.timeSplit(aneUnits, timings.gpuAlone); });
-    AneFfnPrepared prepared = model.prepare(chosen, true);
+    AneFfnPrepared prepared = model.prepare(chosen, true, false);
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
     if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
