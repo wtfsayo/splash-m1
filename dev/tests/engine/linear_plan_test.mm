@@ -694,8 +694,8 @@ void ggufPlans() {
         }
       }
     }
-  // Apple7/8's register tile runs a gate/up pair of one format in one pass for GGUF formats;
-  // MLX af4g64 and pairs of two formats run two passes. The decode scratch bound covers the one pass.
+  // Apple7/8's register tile runs a gate/up pair of one format in one pass: GGUF formats at every lane count, MLX
+  // af4g64 at one and two lanes. Pairs of two formats run two passes. The decode scratch bound covers the one pass.
   for (const uint32_t cores : {8U, 32U, 38U}) {
     const Linear m1 = gpu(7, cores);
     for (const uint32_t n : {1024U, 17408U})
@@ -709,13 +709,26 @@ void ggufPlans() {
                          af4 = m1.plan(gateUp, up_af4, &same_af4);
         const LinearConfig c = one.configuration();
         require(c.tile == LinearTile::GgufRegister && c.fp32Table && c.oneGateUpPass &&
-                    !two.configuration().oneGateUpPass && !af4.configuration().oneGateUpPass,
+                    !two.configuration().oneGateUpPass && af4.configuration().oneGateUpPass == (rows <= 16),
                 "Apple7/8 register gate/up pass default");
         const LinearScratchSize bound = m1.decodeScratchSize({n, 5120}), need = one.scratchSize();
         require(need.partials == uint64_t{2} * c.splits * rows * n * 4 && need.counters == n / 32 * 4 &&
                     bound.partials >= need.partials && bound.counters >= need.counters,
                 "Apple7/8 one-pass gate/up scratch");
       }
+  }
+  // Apple7/8's staged MMA tile holds a prefill chunk of 17 to 24 rows in 24 rows; other devices' tiles hold 8, 16 or
+  // 32.
+  {
+    const Projection down = blockProjection(5120, 17408, 1, GGUF_FMT_AF4G64);
+    const auto storage = [&](uint32_t family, uint32_t rows) {
+      return gpu(family, 32)
+          .plan({{5120, 17408}, rows, LinearPhase::Prefill, LinearEpilogue::Residual}, down)
+          .storageRows();
+    };
+    require(storage(7, 8) == 8 && storage(7, 16) == 16 && storage(7, 17) == 24 && storage(7, 24) == 24 &&
+                storage(7, 25) == 32 && storage(7, 32) == 32 && storage(10, 20) == 32,
+            "Apple7/8 staged prefill tile rows");
   }
   // The 27B's pair, 17408 x 5120 in MLX 4-bit, runs in one pass where its 544 one-pass threadgroups fill whole waves
   // of 16 per core or nearly (20 and 40 cores: 27.2 and 13.6 per core), in two where one pass leaves a second wave of
