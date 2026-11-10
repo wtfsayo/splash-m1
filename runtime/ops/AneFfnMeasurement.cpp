@@ -142,8 +142,10 @@ double Measurement::split(uint32_t aneUnits, double gpuAlone) {
 }
 
 ChunkTimings Measurement::chunks(AneFfn &split) {
+  // The functions a single chunk runs: those below kMinimumRows run a pair's.
   std::vector<uint32_t> rows;
-  for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
+  for (const AneFfn::Evaluation &evaluation : split.evaluations_)
+    if (evaluation.rows >= AneFfn::kMinimumRows) rows.push_back(evaluation.rows);
   // About kCommandRows rows of layers to a command, more layers of fewer rows.
   const auto count = [&](uint32_t chunk) {
     return static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / chunk, 1, layers_.size() - 1));

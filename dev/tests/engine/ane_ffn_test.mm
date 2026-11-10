@@ -571,7 +571,7 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
   for (const uint32_t rows : {AneFfn::kMinimumRows - 1, AneFfn::kMaximumRows + 1})
     test::rejects([&] { split->setMinimumRows(rows); }, "no function of",
                   model.name + ": a least chunk of " + std::to_string(rows) + " rows was taken");
-  // verify() checks every function, and both weight sets, against the leading rows of a full chunk on the GPU
+  // verify() checks every function, in each slot, against the leading rows of a full chunk on the GPU
   // alone, which computes every row alike whatever the chunk's rows.
   const Forward full = forward(backend, linear, model, nullptr, chunk, AneFfn::kMaximumRows);
   for (const uint32_t rows : {AneFfn::kMinimumRows, 700u})
@@ -599,6 +599,56 @@ void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   section("verify: a function bound to the procedure of fewer rows fails it");
 }
 
+// A pair: two chunks' layers in turn in one command, each chunk's join left until the other chunk's FFN is added, as
+// the target's prefill encodes them. Each chunk's output is what the split computes of the chunk alone, bit for bit,
+// and a command with a join left is not committed.
+void pair(MetalBackend &backend, const Linear &linear, const Model &model) {
+  constexpr std::array<uint32_t, 2> kRows{1024, 700};
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model);
+  // Both of 1024 rows: the GPU's tiles run past a chunk's 700.
+  const std::array<Chunk, 2> chunks{chunk(backend, kRows[0]), chunk(backend, kRows[0])};
+  std::array<Forward, 2> alone;
+  for (uint32_t c = 0; c < 2; ++c) {
+    fillRows(chunks[c], kRows[c], [](uint64_t) { return 1.0f; });
+    alone[c] = forward(backend, linear, model, split.get(), chunks[c], kRows[c]);
+    if (!alone[c].usable) fail("pair: chunk " + std::to_string(c) + " alone: " + split->reason());
+    std::memset(chunks[c].hidden[0].contents(), 0, chunks[c].hidden[0].sizeBytes());
+  }
+  CommandGraph graph;
+  if (!split->begin()) fail("pair: the split does not begin a command");
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    for (const Chunk &part : chunks) {
+      const uint32_t rows = kRows[&part - chunks.data()];
+      split->settle(graph, &part);
+      split->add(graph, layer, part.ffn, part.hidden[layer & 1], part.hidden[(layer & 1) ^ 1], rows, &part);
+    }
+  test::rejects([&] { static_cast<void>(split->commit(graph, {})); }, "a join left to settle",
+                "a command with a join left to settle was committed");
+  split->settle(graph);
+  static_cast<void>(split->commit(graph, {}).wait());
+  if (!split->finish()) fail("pair: unusable: " + split->reason());
+  for (uint32_t c = 0; c < 2; ++c)
+    if (std::memcmp(chunks[c].hidden[kLayers & 1].contents(), alone[c].bits.data(), alone[c].bits.size() * 2))
+      fail("pair: chunk " + std::to_string(c) + " differs from its output alone");
+  section("pair: chunks of 1024 and 700 rows layer by layer, each joined after the other's FFN, as each alone");
+
+  // Every command of a least function's rows and half as many again or more, up to a chunk's, has a pair; each chunk
+  // is one the split takes, the first fills a function, and a full command halves.
+  constexpr uint32_t kLeast = AneFfn::kLeastRows, kMost = AneFfn::kMaximumRows;
+  for (uint32_t rows = 1; rows <= kMost + kLeast; ++rows) {
+    const std::optional<uint32_t> first = split->pairRows(rows);
+    if (first.has_value() != (rows >= kLeast + kLeast / 2 && rows <= kMost))
+      fail("pair: a command of " + std::to_string(rows) + " rows " + (first ? "has a pair" : "has no pair"));
+    else if (first && (!split->pairs(*first) || !split->pairs(rows - *first) || *first % (AneFfn::kProgramStep / 2)))
+      fail("pair: a command of " + std::to_string(rows) + " rows starts with " + std::to_string(*first));
+  }
+  // 577 rows: 256 and 321 or 384 and 193 take the same functions; the smaller chunk goes first.
+  if (split->pairRows(kMost) != kMost / 2 || split->pairRows(2 * kLeast) != kLeast ||
+      split->pairRows(1100) != 512u || split->pairRows(577) != 256u || split->pairRows(477) != 256u)
+    fail("pair: 2048, 384, 1100, 577 or 477 rows do not split as 1024, 192, 512, 256 and 256 first");
+  section("pair: the rows of a command's two chunks");
+}
+
 // Layers added out of order and buffers short of a chunk's rows are refused before anything is encoded.
 void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   AneFfn split(backend, model.layers, kAneUnits, nullptr);
@@ -609,8 +659,10 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   test::rejects([&] { split.add(graph, 1, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 0",
                 "the split added layer 1 first");
   split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
-  test::rejects([&] { split.add(graph, 0, ffn, hidden[1], hidden[0], kRows); }, "not its next layer 1",
-                "the split added layer 0 twice");
+  // A layer again is the command's second chunk; it has no third.
+  split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
+  test::rejects([&] { split.add(graph, 0, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 1",
+                "the split added layer 0 for a third chunk");
   test::rejects([&] { split.add(graph, 2, ffn, hidden[1], hidden[0], kRows); }, "not its next layer 1",
                 "the split skipped layer 1");
   const size_t encoded = graph.dispatches().size();
@@ -622,6 +674,9 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   test::rejects([&] { split.add(graph, 1, narrow, hidden[1], hidden[0], kRows); }, "ANE FFN input buffer holds",
                 "an input one element short was accepted");
   if (graph.dispatches().size() != encoded) fail("a refused layer encoded a dispatch");
+  split.add(graph, 1, ffn, hidden[1], hidden[0], kRows);
+  test::rejects([&] { split.add(graph, 0, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 2",
+                "the split went back to layer 0");
   if (!split.begin()) fail("a split does not begin a command again");
   split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
   section("refusals: layers out of order and buffers short of the chunk's rows");
@@ -855,6 +910,7 @@ void split(MetalBackend &backend) {
   split(backend, linear, gguf, buffers);
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
+  pair(backend, linear, mlx);
   quietRows(backend, linear, mlx, buffers);
   massiveChannel(backend, linear, buffers);
   idle(backend, linear, mlx, buffers);

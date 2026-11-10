@@ -170,14 +170,14 @@ constexpr double kIntermediateFloor = 0x1p-9;
 static_assert(ANE_FFN_INT8_PEAK / kIntermediateFloor <= 65504.0,
               "the int8 peak over the floor fits fp16");
 
-// The rows of the program's functions, ascending: the step's from
-// kMinimumRows, as many as leave the budget's own within kMaximumFunctions.
+// The rows of the program's functions, ascending: the pair's least, then one
+// every kProgramStep rows up to a pair's chunk, and one every two steps past
+// it, where only a chunk no pair takes runs.
 std::vector<uint32_t> functionRows() {
-  std::vector<uint32_t> rows;
-  for (uint32_t row = AneFfn::kMinimumRows;
-       row < AneFfn::kMaximumRows && rows.size() + 1 < AneFfn::kMaximumFunctions; row += AneFfn::kProgramStep)
+  std::vector<uint32_t> rows{AneFfn::kLeastRows};
+  for (uint32_t row = AneFfn::kMinimumRows; row <= AneFfn::kMaximumRows;
+       row += row < AneFfn::kMaximumRows / AneFfn::kSlots ? AneFfn::kProgramStep : 2 * AneFfn::kProgramStep)
     rows.push_back(row);
-  rows.push_back(AneFfn::kMaximumRows);
   return rows;
 }
 
@@ -233,19 +233,20 @@ AneFfn::Memory AneFfn::allocate(const Shape &shape, MakeBuffer &&buffer, MakeSur
                             "ane ffn row scales");
   memory.rotated = buffer(uint64_t{kMaximumRows} * shape.hidden * sizeof(_Float16), "ane ffn rotated input");
   memory.status = buffer(sizeof(uint32_t), "ane ffn status");
-  for (const uint32_t width : shape.inputSegments) memory.inputs.push_back(surface(width, kMaximumRows, Element::Int8));
-  memory.tokenScale = surface(1, kMaximumRows, Element::Float16);
-  memory.partial = surface(shape.hidden + 1, kMaximumRows, Element::Float16);
-  for (Weights &set : memory.sets) {
-    for (const uint32_t width : shape.inputSegments) {
-      set.gate.push_back(surface(shape.ane, width, Element::Int8));
-      set.up.push_back(surface(shape.ane, width, Element::Int8));
-    }
-    for (const uint32_t width : shape.downSegments) set.down.push_back(surface(shape.hidden, width, Element::Int8));
-    set.gateScale = surface(shape.ane, 1, Element::Float16);
-    set.upScale = surface(shape.ane, 1, Element::Float16);
-    set.downScale = surface(shape.hidden, 1, Element::Float16);
+  for (Io &io : memory.io) {
+    for (const uint32_t width : shape.inputSegments) io.inputs.push_back(surface(width, kMaximumRows, Element::Int8));
+    io.tokenScale = surface(1, kMaximumRows, Element::Float16);
+    io.partial = surface(shape.hidden + 1, kMaximumRows, Element::Float16);
   }
+  Weights &weights = memory.weights;
+  for (const uint32_t width : shape.inputSegments) {
+    weights.gate.push_back(surface(shape.ane, width, Element::Int8));
+    weights.up.push_back(surface(shape.ane, width, Element::Int8));
+  }
+  for (const uint32_t width : shape.downSegments) weights.down.push_back(surface(shape.hidden, width, Element::Int8));
+  weights.gateScale = surface(shape.ane, 1, Element::Float16);
+  weights.upScale = surface(shape.ane, 1, Element::Float16);
+  weights.downScale = surface(shape.hidden, 1, Element::Float16);
   return memory;
 }
 
@@ -269,24 +270,30 @@ uint64_t AneFfn::plannedBytes(std::span<const SwiGluProjections> layers, uint32_
 // over segment k, and sg and su their per-row scales; wd<i>: down's rotated
 // int8 rows over segment i of its ANE inputs, and sd their per-row scales.
 std::vector<AneFfn::Input> AneFfn::programInputs(const Shape &shape, const Memory &memory) {
-  const auto both = [&](auto member) {
-    return std::array{&(memory.sets[0].*member), &(memory.sets[1].*member)};
+  // A slot's own surface, or the weights' that the slots share.
+  const auto slots = [&](auto surfaceOf) {
+    std::array<const ane::Surface *, kSlots> surfaces;
+    for (uint32_t slot = 0; slot < kSlots; ++slot) surfaces[slot] = surfaceOf(memory.io[slot]);
+    return surfaces;
   };
+  const auto shared = [&](const ane::Surface &surface) { return slots([&](const Io &) { return &surface; }); };
+  const Weights &weights = memory.weights;
+  const uint32_t inputSegments = static_cast<uint32_t>(weights.gate.size());
   std::vector<Input> inputs;
-  for (uint32_t k = 0; k < memory.inputs.size(); ++k)
-    inputs.push_back({"x" + std::to_string(k), {&memory.inputs[k], &memory.inputs[k]}, shape.inputSegments[k], 0});
-  inputs.push_back({"tx", {&memory.tokenScale, &memory.tokenScale}, 1, 0});
-  for (uint32_t k = 0; k < memory.inputs.size(); ++k) {
+  for (uint32_t k = 0; k < inputSegments; ++k)
+    inputs.push_back(
+        {"x" + std::to_string(k), slots([&](const Io &io) { return &io.inputs[k]; }), shape.inputSegments[k], 0});
+  inputs.push_back({"tx", slots([](const Io &io) { return &io.tokenScale; }), 1, 0});
+  for (uint32_t k = 0; k < inputSegments; ++k) {
     const uint32_t width = shape.inputSegments[k];
-    inputs.push_back({"wg" + std::to_string(k), {&memory.sets[0].gate[k], &memory.sets[1].gate[k]}, shape.ane, width});
-    inputs.push_back({"wu" + std::to_string(k), {&memory.sets[0].up[k], &memory.sets[1].up[k]}, shape.ane, width});
+    inputs.push_back({"wg" + std::to_string(k), shared(weights.gate[k]), shape.ane, width});
+    inputs.push_back({"wu" + std::to_string(k), shared(weights.up[k]), shape.ane, width});
   }
-  inputs.push_back({"sg", both(&Weights::gateScale), shape.ane, 1});
-  inputs.push_back({"su", both(&Weights::upScale), shape.ane, 1});
+  inputs.push_back({"sg", shared(weights.gateScale), shape.ane, 1});
+  inputs.push_back({"su", shared(weights.upScale), shape.ane, 1});
   for (uint32_t i = 0; i < shape.downSegments.size(); ++i)
-    inputs.push_back({"wd" + std::to_string(i), {&memory.sets[0].down[i], &memory.sets[1].down[i]}, shape.hidden,
-                      shape.downSegments[i]});
-  inputs.push_back({"sd", both(&Weights::downScale), shape.hidden, 1});
+    inputs.push_back({"wd" + std::to_string(i), shared(weights.down[i]), shape.hidden, shape.downSegments[i]});
+  inputs.push_back({"sd", shared(weights.downScale), shape.hidden, 1});
   return inputs;
 }
 
@@ -404,7 +411,7 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
                std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
     : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
-      handoff_(backend, kHandoffBound) {
+      handoff_(backend, kHandoffBound, kSlots) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(
       shape_,
@@ -429,21 +436,21 @@ AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> 
                        source.down->leadingInputs(shape_.gpu)});
 
   const std::vector<Input> inputs = programInputs(shape_, memory_);
-  program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.partial, functionRows),
+  program_ = std::make_unique<ane::Program>(program(shape_, inputs, memory_.io[0].partial, functionRows),
                                             rotationBlob(shape_.ane, signs),
                                             ane::Program::Limits{kProgramLimit, std::move(interrupted)});
   for (const uint32_t rows : functionRows) {
     Evaluation &evaluation = evaluations_.emplace_back();
     evaluation.rows = rows;
     const uint32_t procedure = program_->procedure(functionName(rows));
-    for (uint32_t set = 0; set < 2; ++set) {
+    for (uint32_t slot = 0; slot < kSlots; ++slot) {
       std::vector<ane::Surface> surfaces;
       for (const std::string &name : program_->inputs(procedure)) {
         const auto input = std::ranges::find(inputs, name, &Input::name);
         if (input == inputs.end()) throw std::logic_error("ANE FFN program has an unknown input " + name);
-        surfaces.push_back(*input->surfaces[set]);
+        surfaces.push_back(*input->surfaces[slot]);
       }
-      evaluation.bindings.push_back(program_->bind(procedure, surfaces, memory_.partial));
+      evaluation.bindings.push_back(program_->bind(procedure, surfaces, memory_.io[slot].partial));
     }
   }
 
@@ -477,16 +484,38 @@ bool AneFfn::splits(uint32_t rows) const {
   return rows >= minimumRows_ && rows <= kMaximumRows && !handoff_.retired();
 }
 
+bool AneFfn::pairs(uint32_t rows) const {
+  return rows >= kLeastRows / 2 && rows <= kMaximumRows / kSlots && !handoff_.retired();
+}
+
+std::optional<uint32_t> AneFfn::pairRows(uint32_t rows) const {
+  // By the larger of the pair's functions, then by both, then with the first
+  // chunk the smaller: ascending, the first found of a rank stays.
+  std::optional<uint32_t> best;
+  std::array<uint32_t, 3> least{};
+  for (const Evaluation &evaluation : evaluations_) {
+    const uint32_t first = evaluation.rows;
+    if (first >= rows || !pairs(first) || !pairs(rows - first)) continue;
+    const uint32_t rest = rows - first;
+    const uint32_t function =
+        std::ranges::find_if(evaluations_, [&](const Evaluation &other) { return other.rows >= rest; })->rows;
+    const std::array<uint32_t, 3> rank{std::max(first, function), first + function, first > rest};
+    if (best && rank >= least) continue;
+    best = first;
+    least = rank;
+  }
+  return best;
+}
+
 metal::MetalBuffer AneFfn::rowScales(uint32_t layer, Matrix matrix) const {
   const uint64_t perLayer = 2 * shape_.ane + shape_.hidden, part = static_cast<uint64_t>(matrix);
   return backend_.view(memory_.rowScales, (layer * perLayer + part * shape_.ane) * sizeof(_Float16),
                        uint64_t{matrix == Matrix::Down ? shape_.hidden : shape_.ane} * sizeof(_Float16));
 }
 
-// Layer `layer`'s int8 weights and row scales into staging set `set`.
-void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set) const {
+void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer) const {
   const Layer &source = layers_.at(layer);
-  const Weights &target = memory_.sets[set];
+  const Weights &target = memory_.weights;
   const auto add = [&](Matrix matrix, const ane::Surface &output, const ane::Surface &scale, uint32_t row,
                        uint32_t input, uint32_t width, uint32_t rows, Rotation rotation) {
     const Planes &planes = source.planes[static_cast<size_t>(matrix)];
@@ -522,63 +551,115 @@ bool AneFfn::begin() {
     warnStopped();
   }
   jobs_.clear();
-  nextLayer_ = 0;
+  for (std::optional<Pending> &pending : pending_) pending.reset();
+  nextLayer_ = layerChunks_ = 0;
   return !handoff_.retired();
 }
 
 void AneFfn::add(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn,
-                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows) {
-  encode(graph, layer, ffn, residual, output, rows, Parts::Both);
+                 metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, const void *owner) {
+  encode(graph, layer, ffn, residual, output, rows, Parts::Both, owner);
+}
+
+void AneFfn::settle(metal::CommandGraph &graph, const void *owner) {
+  for (uint32_t slot = 0; slot < kSlots; ++slot)
+    if (pending_[slot] && (!owner || pending_[slot]->owner == owner)) settleSlot(graph, slot);
+}
+
+void AneFfn::settleSlot(metal::CommandGraph &graph, uint32_t slot) {
+  if (!pending_[slot]) return;
+  const Pending &pending = *pending_[slot];
+  const Io &io = memory_.io[slot];
+  const uint32_t rows = pending.rows, tiles = (rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE;
+  if (pending.done) graph.wait(handoff_.event(slot), *pending.done);
+  graph.add("ane_ffn_join", {pending.output, io.partial.buffer, io.tokenScale.buffer, memory_.status},
+            AneFfnJoinParams{shape_.hidden, io.partial.strideBytes / uint32_t{sizeof(_Float16)}, rows},
+            {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
+  pending_[slot].reset();
 }
 
 void AneFfn::encode(metal::CommandGraph &graph, uint32_t layer, const PrefillFfnBuffers &ffn,
-                    metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, Parts parts) {
-  if (rows < kMinimumRows || rows > kMaximumRows)
+                    metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows, Parts parts,
+                    const void *owner) {
+  if (rows < kLeastRows / 2 || rows > kMaximumRows)
     throw std::invalid_argument("ANE FFN split does not take a chunk of these rows");
-  if (layer != nextLayer_ || layer >= layers_.size())
+  // A layer's chunks follow one another before the next layer.
+  const bool first = layer == nextLayer_;
+  if ((!first && (layer + 1 != nextLayer_ || layerChunks_ == kSlots)) || layer >= layers_.size())
     throw std::logic_error("ANE FFN split adds layer " + std::to_string(layer) + ", not its next layer " +
                            std::to_string(nextLayer_) + " (begin() starts each command at layer 0)");
   const uint64_t hiddenBytes = uint64_t{rows} * shape_.hidden * sizeof(uint16_t);
   requireBytes(ffn.normalized, hiddenBytes, "ANE FFN input");
   requireBytes(output, hiddenBytes, "ANE FFN output");
   const Layer &current = layers_[layer];
-  const uint32_t set = layer & 1, tiles = (rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE;
+  const uint32_t slot = (firstSlot_ + (first ? 0 : layerChunks_)) % kSlots;
+  const uint32_t tiles = (rows + ANE_FFN_TILE - 1) / ANE_FFN_TILE;
   const bool ane = parts == Parts::Both;
   const auto found =
       std::ranges::find_if(evaluations_, [&](const Evaluation &evaluation) { return evaluation.rows >= rows; });
   if (found == evaluations_.end()) throw std::invalid_argument("ANE FFN has no function of the chunk's rows");
   const auto index = static_cast<uint32_t>(found - evaluations_.begin());
-  // Each command stages layer 0's weights, then each layer the next one's.
-  if (!layer) addWeights(graph, 0, 0);
-  graph.add("ane_ffn_rotate", {ffn.normalized, memory_.signs, memory_.rotated, memory_.tokenScale.buffer},
+  // The chunk's evaluation of the layer before holds the slot's surfaces.
+  settleSlot(graph, slot);
+  const Io &io = memory_.io[slot];
+  graph.add("ane_ffn_rotate", {ffn.normalized, memory_.signs, memory_.rotated, io.tokenScale.buffer},
             AneFfnRotateParams{shape_.hidden}, {rows, 1, 1}, {ANE_FFN_ROTATE_THREADS, 1, 1});
   uint32_t channel = 0;
   for (size_t k = 0; k < shape_.inputSegments.size(); ++k) {
     const uint32_t width = shape_.inputSegments[k];
-    graph.add("ane_ffn_pack", {memory_.rotated, memory_.inputs[k].buffer},
-              AneFfnPackParams{shape_.hidden, channel, memory_.inputs[k].strideBytes},
+    graph.add("ane_ffn_pack", {memory_.rotated, io.inputs[k].buffer},
+              AneFfnPackParams{shape_.hidden, channel, io.inputs[k].strideBytes},
               {tiles, width / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
     channel += width;
   }
-  const uint64_t ready = ane ? handoff_.next() : 0;
-  if (ane) graph.signal(handoff_.event(), ready);
+  // The layer's weights replace the layer before's once every evaluation of
+  // that layer is done: the other chunk's may still run, beside this chunk's
+  // mixer and the packing above.
+  if (first) {
+    settle(graph);
+    addWeights(graph, layer);
+  }
+  const uint64_t ready = ane ? handoff_.next(slot) : 0;
+  if (ane) graph.signal(handoff_.event(slot), ready);
   linear_.addPrefillSwiGlu(graph, {&current.gate, &current.up, &current.down}, ffn, residual, output, rows);
-  if (layer + 1 < layers_.size()) addWeights(graph, layer + 1, set ^ 1);
-  const uint64_t done = ane ? handoff_.next() : 0;
-  if (ane) graph.wait(handoff_.event(), done);
-  graph.add("ane_ffn_join", {output, memory_.partial.buffer, memory_.tokenScale.buffer, memory_.status},
-            AneFfnJoinParams{shape_.hidden, memory_.partial.strideBytes / uint32_t{sizeof(_Float16)}, rows},
-            {tiles, shape_.hidden / ANE_FFN_TILE, 1}, {ANE_FFN_TILE, ANE_FFN_TILE_ROWS, 1});
-  if (ane) jobs_.push_back({index, set, ready, done});
-  ++nextLayer_;
+  pending_[slot] = Pending{owner, ane ? std::optional<uint64_t>(handoff_.next(slot)) : std::nullopt, output, rows};
+  if (ane) jobs_.push_back({index, slot, ready, *pending_[slot]->done});
+  if (first) ++nextLayer_;
+  layerChunks_ = first ? 1 : layerChunks_ + 1;
+  // A chunk without an owner reads its output next.
+  if (!owner) settle(graph);
+}
+
+AneFfn::~AneFfn() {
+  std::lock_guard lock(lifeline_->mutex);
+  lifeline_->split = nullptr;
 }
 
 metal::CommandTicket AneFfn::commit(const metal::CommandGraph &graph, metal::CommandCompletion completion) {
+  if (std::ranges::any_of(pending_, [](const std::optional<Pending> &pending) { return pending.has_value(); }))
+    throw std::logic_error("ANE FFN split committed with a join left to settle");
   const std::vector<Job> jobs = std::exchange(jobs_, {});
-  for (const Job &job : jobs) queue(job);
+  // The service failed one of the 128 evaluations of a 64-layer model's two
+  // chunks queued at once (an M1 Max, macOS 26.6). A slot's first kQueued are
+  // queued here, and each later one as the one that many before it finishes,
+  // which the slot's event tells.
+  constexpr size_t kQueued = 32;
+  std::array<std::vector<uint64_t>, kSlots> done;
+  for (const Job &job : jobs) {
+    std::vector<uint64_t> &before = done[job.slot];
+    if (before.size() < kQueued)
+      queue(job);
+    else
+      handoff_.event(job.slot).notify(before[before.size() - kQueued], [lifeline = lifeline_, job] {
+        std::lock_guard lock(lifeline->mutex);
+        if (lifeline->split) lifeline->split->queue(job);
+      });
+    before.push_back(job.done);
+  }
   unfinished_ = !jobs.empty();
   committedEvaluations_ = static_cast<uint32_t>(jobs.size());
   committedRows_ = jobs.empty() ? 0 : evaluations_[jobs.front().evaluation].rows;
+  committedPair_ = std::ranges::any_of(jobs, [](const Job &job) { return job.slot != 0; });
   const auto cancel = [&](const std::string &reason) {
     if (!std::exchange(unfinished_, false)) return;
     handoff_.cancel(reason);
@@ -606,6 +687,9 @@ bool AneFfn::finish() {
   ++served_.commands;
   served_.evaluations += committedEvaluations_;
   served_.milliseconds += milliseconds;
+  // The breaker's bound is a single chunk's, whose evaluation the GPU waits
+  // through: a pair's runs beside the other chunk's mixer, and gains past it.
+  if (committedPair_) return true;
   if (std::string losing = breaker_.add(committedRows_, committedEvaluations_, milliseconds); !losing.empty()) {
     handoff_.retire(std::move(losing));
     warnStopped();
@@ -666,11 +750,13 @@ void AneFfn::warnStopped() {
 }
 
 void AneFfn::queue(const Job &job) {
-  const ane::Program::Binding &binding = evaluations_.at(job.evaluation).bindings.at(job.set);
-  handoff_.queue(job.ready, job.done,
-                 [&](const metal::SharedEvent &event, uint64_t wait, uint64_t signal, ane::Handoff::Report report) {
-                   program_->enqueue(binding, event, wait, signal, std::move(report));
-                 });
+  const ane::Program::Binding &binding = evaluations_.at(job.evaluation).bindings.at(job.slot);
+  handoff_.queue(
+      job.ready, job.done,
+      [&](const metal::SharedEvent &event, uint64_t wait, uint64_t signal, ane::Handoff::Report report) {
+        program_->enqueue(binding, event, wait, signal, std::move(report));
+      },
+      job.slot);
 }
 
 void AneFfn::fillNormalized(const metal::MetalBuffer &normalized) {
@@ -690,14 +776,16 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
   fillNormalized(ffn.normalized);
   // Layer l adds its FFN of the normalized rows to hidden[l & 1] into
   // hidden[(l & 1) ^ 1], from zeros, on the GPU alone, as the split's GPU part
-  // alone over a partial output of zeros, or split.
+  // alone over a partial output of zeros, or split in slot `slot`.
   enum class Way : uint8_t { Gpu, GpuPart, Split };
-  const auto forward = [&](Way way, uint32_t count, uint32_t rows) {
+  const auto forward = [&](Way way, uint32_t count, uint32_t rows, uint32_t slot = 0) {
     std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
     if (way != Way::Gpu) {
-      std::fill_n(static_cast<uint16_t *>(memory_.partial.buffer.contents()),
-                  memory_.partial.buffer.sizeBytes() / sizeof(uint16_t), way == Way::Split ? kHalfNaN : 0);
+      const metal::MetalBuffer &partial = memory_.io[slot].partial.buffer;
+      std::fill_n(static_cast<uint16_t *>(partial.contents()), partial.sizeBytes() / sizeof(uint16_t),
+                  way == Way::Split ? kHalfNaN : 0);
       static_cast<void>(begin());
+      firstSlot_ = slot;
     }
     metal::CommandGraph graph;
     for (uint32_t layer = 0; layer < count; ++layer) {
@@ -707,6 +795,7 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
       else
         encode(graph, layer, ffn, residual, output, rows, way == Way::Split ? Parts::Both : Parts::Gpu);
     }
+    firstSlot_ = 0;
     if (way == Way::Split) {
       static_cast<void>(commit(graph, {}).wait());
       if (!completed())
@@ -725,21 +814,23 @@ double AneFfn::verify(std::span<const SwiGluProjections> layers, const PrefillFf
   double worst = 0.0;
   for (const Evaluation &evaluation : evaluations_) {
     const uint32_t rows = evaluation.rows;
-    const std::vector<float> split = forward(Way::Split, count, rows);
-    const auto fail = [&](const std::string &why) {
-      handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
-      throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
-    };
-    double difference = 0.0, contribution = 0.0;
-    for (size_t i = 0; i < split.size(); ++i) {
-      if (!std::isfinite(split[i])) fail("is not finite");
-      difference += (double(split[i]) - gpu[i]) * (double(split[i]) - gpu[i]);
-      contribution += (double(gpu[i]) - part[i]) * (double(gpu[i]) - part[i]);
+    for (uint32_t slot = 0; slot < kSlots; ++slot) {
+      const std::vector<float> split = forward(Way::Split, count, rows, slot);
+      const auto fail = [&](const std::string &why) {
+        handoff_.retire("its output of " + std::to_string(rows) + " rows " + why);
+        throw std::runtime_error("ANE FFN split's output of " + std::to_string(rows) + " rows " + why);
+      };
+      double difference = 0.0, contribution = 0.0;
+      for (size_t i = 0; i < split.size(); ++i) {
+        if (!std::isfinite(split[i])) fail("is not finite");
+        difference += (double(split[i]) - gpu[i]) * (double(split[i]) - gpu[i]);
+        contribution += (double(gpu[i]) - part[i]) * (double(gpu[i]) - part[i]);
+      }
+      const double error = std::sqrt(difference / contribution);
+      if (!(error <= kMaximumAneError))
+        fail("differs from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
+      worst = std::max(worst, error);
     }
-    const double error = std::sqrt(difference / contribution);
-    if (!(error <= kMaximumAneError))
-      fail("differs from the GPU alone's by " + std::to_string(100.0 * error) + "% of the Neural Engine's part");
-    worst = std::max(worst, error);
   }
   return worst;
 }
