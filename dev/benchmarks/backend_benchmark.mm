@@ -750,12 +750,13 @@ uint32_t parseAneFfnMinimumRows(std::string_view value) {
   return rows;
 }
 
-// --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
-double parseAneFfnShare(std::string_view value) {
+// --ane-ffn-share and --ane-ffn-short-share: the prefill FFN's Neural Engine
+// share, and its share in short commands, in [0, 1).
+double parseAneFfnShare(std::string_view option, std::string_view value) {
   double share = 0.0;
   const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), share);
   if (error != std::errc{} || end != value.data() + value.size() || !(share >= 0.0 && share < 1.0))
-    throw std::invalid_argument("--ane-ffn-share takes a share in [0, 1)");
+    throw std::invalid_argument(std::string(option) + " takes a share in [0, 1)");
   return share;
 }
 
@@ -894,7 +895,7 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--ane-ffn-minimum-rows ROWS] [--ane-ffn-short-share SHARE]] [--max-context TOKENS] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -902,6 +903,8 @@ int main(int argc, char **argv) {
                    "to run instead of calibrating one (0: GPU alone)\n"
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
+                   "  --ane-ffn-short-share: the share in commands of fewer than 1024 rows "
+                   "(default: the same)\n"
                    "  TOKENS: the context the engine serves, as serve's "
                    "--max-context, with YaRN past the model's native window "
                    "(default: what memory holds)\n"
@@ -914,7 +917,7 @@ int main(int argc, char **argv) {
     uint32_t samples = 1;
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
-    std::optional<double> aneFfnShare;
+    std::optional<double> aneFfnShare, aneFfnShortShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
@@ -931,7 +934,9 @@ int main(int argc, char **argv) {
       } else if (option == "--scenario") {
         selected = parseScenarios(argv[index + 1]);
       } else if (option == "--ane-ffn-share") {
-        aneFfnShare = parseAneFfnShare(argv[index + 1]);
+        aneFfnShare = parseAneFfnShare(option, argv[index + 1]);
+      } else if (option == "--ane-ffn-short-share") {
+        aneFfnShortShare = parseAneFfnShare(option, argv[index + 1]);
       } else if (option == "--ane-ffn-minimum-rows") {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
@@ -963,7 +968,7 @@ int main(int argc, char **argv) {
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
-    config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows, aneFfnShortShare);
     // The verify budget's rows follow the wall times and acceptance of the
     // cycles before them, so a MoE target's outputs would not repeat from
     // round to round: every cycle verifies every row (--verify-rows all), and
