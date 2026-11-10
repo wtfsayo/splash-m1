@@ -30,6 +30,7 @@ idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
 ane_ffn_share | --ane-ffn-share 0.35 | auto auto --ane-ffn-share 0.35
 ane_ffn_rows | --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520
+ane_ffn_short | --ane-ffn-share 0.75 --ane-ffn-short-share 0.5 | auto auto --ane-ffn-share 0.75 --ane-ffn-short-share 0.5
 ane_ffn_gpu | --ane-ffn-share 0 | auto auto --ane-ffn-share 0.0
 ane_ffn_disabled | --disable-ane --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane off
 prefill_full | --prefill-mode full | auto auto --prefill-mode full

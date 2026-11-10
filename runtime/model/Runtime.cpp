@@ -2934,9 +2934,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl_->request(items[lane].requestId).unreadableBlocks.clear();
   CommandGraph graph;
   if (impl_->aneFfn) {
-    for (uint32_t lane = 0; lane < items.size(); ++lane)
+    uint32_t rows = 0;
+    for (uint32_t lane = 0; lane < items.size(); ++lane) {
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
-    impl_->aneFfn->begin();
+      rows += items[lane].tokenCount;
+    }
+    impl_->aneFfn->begin(rows);
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;

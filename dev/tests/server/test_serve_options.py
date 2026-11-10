@@ -109,6 +109,13 @@ OPTIONS = {
             *values("--ane-ffn-minimum-rows", {}, ("0", "-1", "1.5", "rows"))[1],
         ],
     ),
+    "--ane-ffn-short-share": (
+        [(["--ane-ffn-short-share=0.5", "--ane-ffn-share=0.75"], 0.5)],
+        [
+            ["--ane-ffn-short-share=0.5"],
+            *values("--ane-ffn-short-share", {}, ("1", "-0.1", "nan", "half"))[1],
+        ],
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

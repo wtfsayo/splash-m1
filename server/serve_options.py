@@ -911,6 +911,18 @@ SERVE_OPTIONS = (
         needs="dense_ffn",
     ),
     ServeOption(
+        "--ane-ffn-short-share",
+        "requests",
+        dict(
+            type=parse_ane_ffn_share,
+            default=None,
+            metavar="SHARE",
+            help="the Neural Engine's share at --ane-ffn-share in prefill "
+            "commands of fewer than 1024 rows, less than that share "
+            "(default: the same share)",
+        ),
+    ),
+    ServeOption(
         "--verify-rows",
         "requests",
         dict(
@@ -975,6 +987,8 @@ def check_serve_arguments(parser, args):
         parser.error("--cache-dir needs --persistent-cache")
     if args.ane_ffn_minimum_rows is not None and args.ane_ffn_share is None:
         parser.error("--ane-ffn-minimum-rows needs --ane-ffn-share")
+    if args.ane_ffn_short_share is not None and args.ane_ffn_share is None:
+        parser.error("--ane-ffn-short-share needs --ane-ffn-share")
 
 
 def serve_argv(args):

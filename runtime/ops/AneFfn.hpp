@@ -59,6 +59,8 @@ public:
   // The GPU part's down projection is a view of leading inputs, which only
   // the prefill residual tile runs: no chunk the split takes stages.
   static_assert(kLeastRows / kSlots > kMaximumStagedPrefillRows, "the split's chunks run the prefill residual tile");
+  // A command of fewer rows runs the short tier, where the split has one.
+  static constexpr uint32_t kShortRows = kMaximumRows / kSlots;
 
   // The ANE takes `aneUnits` of the units() of intermediate channels. The
   // program is compiled and loaded here, and the wait for the ANE's service
@@ -66,6 +68,16 @@ public:
   // takes every chunk its functions hold until setMinimumRows().
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
          std::function<bool()> interrupted);
+  // The same with a short tier: in commands of fewer than kShortRows rows the
+  // ANE takes `shortUnits` units, fewer than `aneUnits` and the last of
+  // them, or with 0 as in the others. Each evaluation reads its layer's
+  // weights whatever the chunk's rows, and each layer's weights are staged
+  // once a command, so the fewer rows a command has the fewer channels the
+  // ANE takes fastest: on a 32-core M1 Max a pair of the 27B's chunks of 515
+  // rows in all ran 200 tok/s with 0.62 of the channels and 175 with 0.74,
+  // one of 1997 rows 231 against 256.
+  AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+         uint32_t shortUnits, std::function<bool()> interrupted);
   // Ends what the event's notifications share with the split (commit()).
   ~AneFfn();
   AneFfn(const AneFfn &) = delete;
@@ -80,8 +92,10 @@ public:
   // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
 
-  // The fraction of intermediate channels the ANE takes.
+  // The fraction of intermediate channels the ANE takes, and in the short
+  // tier's commands, 0 without one.
   [[nodiscard]] double share() const noexcept;
+  [[nodiscard]] double shortShare() const noexcept;
   // What Metal allocated for the split, which plannedBytes() bounds.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept { return allocatedBytes_; }
   // The least rows of a chunk the split takes (ane_ffn::minimumRows), from
@@ -142,8 +156,9 @@ public:
   [[nodiscard]] bool retired() const { return handoff_.retired(); }
   [[nodiscard]] std::string reason() const { return handoff_.reason(); }
 
-  // Starts encoding a command; false once the split stopped.
-  bool begin();
+  // Starts encoding a command of `rows` rows in all, whose tier its chunks
+  // run; false once the split stopped.
+  bool begin(uint32_t rows = kMaximumRows);
   // Layer `layer`'s FFN of a chunk of `rows` rows, from kMinimumRows to
   // kMaximumRows: output = residual + FFN of ffn.normalized. A command adds
   // its layers in order from layer 0 after begin(), and a layer once per
@@ -255,28 +270,41 @@ private:
     uint32_t rows = 0;
     std::vector<ane::Program::Binding> bindings;
   };
-  // An evaluation of slot `slot`: it starts once the slot's event reaches
-  // `ready`, and raises it to `done`.
+  // The commands whose chunks take one share of the channels: the channels,
+  // the GPU's share of each layer, the program's functions over the ANE's,
+  // by rows ascending, and the first of gate's and up's row scales that are
+  // its rows'. The last tier takes the most channels: it sizes the surfaces,
+  // whose leading rows and widths the other reads, and its row scales serve
+  // both, down's over a few more inputs than the short tier's rows read.
+  struct Tier final {
+    Shape shape;
+    std::vector<Layer> layers;
+    std::vector<Evaluation> evaluations;
+    uint32_t scaleRow = 0;
+  };
+  // An evaluation of tier `tier` in slot `slot`: it starts once the slot's
+  // event reaches `ready`, and raises it to `done`.
   struct Job final {
-    uint32_t evaluation, slot;
+    uint32_t tier, evaluation, slot;
     uint64_t ready, done;
   };
 
-  // The split with a function of each of `functionRows` rows, ascending.
+  // The split with a function of each of `functionRows` rows, ascending, or
+  // with none given its tiers' own.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+         uint32_t shortUnits, std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them.
   template <class MakeBuffer, class MakeSurface>
   [[nodiscard]] static Memory allocate(const Shape &shape, MakeBuffer &&buffer, MakeSurface &&surface);
-  // The program's inputs; the program over them, with a function of each of
-  // `rows` rows; and its function of `rows` rows.
+  // A tier's inputs of the program; and its function of `rows` rows over
+  // them, named `name`, whose rotation is the constant at `rotation` of the
+  // program's blob.
   [[nodiscard]] static std::vector<Input> programInputs(const Shape &shape, const Memory &memory);
-  [[nodiscard]] static std::string program(const Shape &shape, std::span<const Input> inputs,
-                                           const ane::Surface &output, std::span<const uint32_t> rows);
   [[nodiscard]] static std::string function(const Shape &shape, std::span<const Input> inputs,
-                                            const ane::Surface &output, uint32_t rows);
+                                            const ane::Surface &output, uint32_t rows, const std::string &name,
+                                            uint64_t rotation);
   // Fills the CPU-visible bf16 rows `normalized` with the same values of a
   // normalized row's magnitude each time.
   static void fillNormalized(const metal::MetalBuffer &normalized);
@@ -284,10 +312,14 @@ private:
               metal::MetalBuffer output, uint32_t rows, Parts parts, const void *owner = nullptr);
   // Encodes slot `slot`'s pending join.
   void settleSlot(metal::CommandGraph &graph, uint32_t slot);
-  // Layer `layer`'s int8 weights and row scales, once no evaluation reads
-  // the layer before's.
+  // Layer `layer`'s int8 weights and row scales of the command's tier, once
+  // no evaluation reads the layer before's.
   void addWeights(metal::CommandGraph &graph, uint32_t layer) const;
-  [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix) const;
+  [[nodiscard]] metal::MetalBuffer rowScales(uint32_t layer, Matrix matrix, const Tier &tier) const;
+  // The tier of a command of `rows` rows.
+  [[nodiscard]] uint32_t tierOf(uint32_t rows) const noexcept {
+    return tiers_.size() > 1 && rows >= kShortRows ? 1 : 0;
+  }
   // Starts `job` on the ANE through the handoff.
   void queue(const Job &job);
   // finish() but for its log line and judgment: if every evaluation of the
@@ -300,13 +332,13 @@ private:
 
   metal::MetalBackend &backend_;
   const Linear linear_;
-  Shape shape_;
   uint32_t minimumRows_ = kMinimumRows;
-  std::vector<Layer> layers_;
+  // The short tier, when there is one, then the other.
+  std::vector<Tier> tiers_;
+  // The tier of the command being encoded.
+  uint32_t tier_ = 0;
   Memory memory_;
   std::unique_ptr<ane::Program> program_;
-  // By rows, ascending.
-  std::vector<Evaluation> evaluations_;
   // The jobs of the command being encoded, which commit() starts; the layer
   // it adds next, and the chunks added of the layer before it, which take
   // the slots from firstSlot_ on in turn (verify() checks each slot as the

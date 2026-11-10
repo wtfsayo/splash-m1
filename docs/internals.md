@@ -913,6 +913,17 @@ is near 0.5 where a pair's is higher: on a 32-core M1 Max, Qwen3.8-27B's cold
 prefill of 6.7K tokens runs 212 tok/s at the calibrated 0.50 and 254 tok/s
 with `--ane-ffn-share 0.735`.
 
+Each evaluation reads its layer's weights whatever the chunk's rows, and the
+GPU stages each layer's once a command, so the fewer rows a command has the
+fewer channels the ANE takes fastest. A split may therefore have a short tier
+(`--ane-ffn-short-share`, `AneFfn::kShortRows`): commands of fewer than 1024
+rows run functions over fewer of the ANE's channels, in the same program and
+the same surfaces, whose leading rows and widths they read, so the tier costs
+no memory. The program then holds the short tier's functions every 64 rows
+from 192 to 512 and the other's every 128 from 512 to 1024 and of 2048. On the
+M1 Max above at share 0.735, a pair of 515 rows in all ran 175 tok/s and one
+at 0.62 ran 200.
+
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
 which is the same with the split or without, every step arithmetic until the

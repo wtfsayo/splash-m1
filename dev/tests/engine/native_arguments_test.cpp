@@ -159,6 +159,11 @@ void testServerCommandLines(const char *path) {
          read.aneFfnShare = 0.35;
          read.aneFfnMinimumRows = 520;
        }},
+      {"ane_ffn_short",
+       [](NativeArguments &read) {
+         read.aneFfnShare = 0.75;
+         read.aneFfnShortShare = 0.5;
+       }},
       {"ane_ffn_gpu", [](NativeArguments &read) { read.aneFfnShare = 0.0; }},
       // --disable-ane outranks a share, which the server then leaves out.
       {"ane_ffn_disabled", [](NativeArguments &read) { read.neuralEngine = false; }},
@@ -340,6 +345,9 @@ void testRefusals() {
             "--ane-ffn-minimum-rows requires a positive row count");
   refuses({"auto", "auto", "--ane-ffn-minimum-rows", "520"},
           "--ane-ffn-minimum-rows requires --ane-ffn-share");
+  refuses({"auto", "auto", "--ane-ffn-share", "0.7", "--ane-ffn-short-share", "1"},
+          "--ane-ffn-short-share requires a share in [0, 1)");
+  refuses({"auto", "auto", "--ane-ffn-short-share", "0.6"}, "--ane-ffn-short-share requires --ane-ffn-share");
   refuses({"auto", "auto", "--ane", "off", "--ane-ffn-share", "0.35"},
           "--ane-ffn-share requires --ane on");
   for (const char *rows : {"budget", "every", "ALL", ""})

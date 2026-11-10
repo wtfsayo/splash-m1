@@ -489,7 +489,7 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
   const bool splits = split && split->splits(rows);
-  if (split) static_cast<void>(split->begin());
+  if (split) static_cast<void>(split->begin(rows));
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
     const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
     if (splits)
@@ -597,6 +597,44 @@ void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
                 "split of 640 rows failed", "verify() passed a function bound to another's procedure");
   if (!split.retired() || split.splits(AneFfn::kMaximumRows)) fail("a split that failed verify() did not stop");
   section("verify: a function bound to the procedure of fewer rows fails it");
+}
+
+// A short tier: commands of fewer than kShortRows rows on fewer of the ANE's channels, in the one program and the
+// same surfaces. Chunks of either tier compute what the GPU computes alone within int8's error, verify() passes every
+// function of both, and each tier's pairs are of its own functions.
+void tiers(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kShortUnits = 4, kShort = AneFfn::kShortRows;
+  AneFfn split(backend, model.layers, kAneUnits, kShortUnits, nullptr);
+  if (split.share() != 0.5 || split.shortShare() != double(kShortUnits) / AneFfn::units(model.layers))
+    fail("tiers: shares " + std::to_string(split.share()) + " and " + std::to_string(split.shortShare()));
+  if (split.allocatedBytes() > AneFfn::plannedBytes(model.layers, kAneUnits))
+    fail("tiers: the short tier allocated beyond the plan of the other's units");
+  test::rejects([&] { AneFfn same(backend, model.layers, kAneUnits, kAneUnits, nullptr); }, "short tier",
+                "a short tier of the other's units was built");
+  fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  for (const uint32_t rows : {AneFfn::kMaximumRows, kShort, kShort / 2, 300u, AneFfn::kMinimumRows}) {
+    const Forward expected = forward(backend, linear, model, nullptr, chunk, rows);
+    const Forward got = forward(backend, linear, model, &split, chunk, rows);
+    const auto [error, finite] = difference(expected, got);
+    std::cout << "  " << rows << " rows: " << 100.0 * error << "% RMS from the GPU alone\n";
+    if (!got.usable || !finite || !(error <= kMaximumError))
+      fail("tiers, " + std::to_string(rows) + " rows: " + std::to_string(100.0 * error) + "% RMS from the GPU alone" +
+           (got.usable ? "" : ", unusable: " + split.reason()));
+  }
+  const double error = split.verify(model.layers, chunk.ffn, chunk.hidden);
+  std::cout << "  verified, " << 100.0 * error << "% from the GPU alone on the Neural Engine's part\n";
+  if (split.retired()) fail("tiers: verify stopped the split: " + split.reason());
+  // A short command's chunks are at most half of kShortRows rows each, the others' at least that.
+  for (uint32_t rows = AneFfn::kLeastRows + AneFfn::kLeastRows / 2; rows <= AneFfn::kMaximumRows; ++rows) {
+    const std::optional<uint32_t> first = split.pairRows(rows);
+    if (!first || (rows < kShort ? *first > kShort / 2 || rows - *first > kShort / 2 : *first < kShort / 2))
+      fail("tiers: a command of " + std::to_string(rows) + " rows starts with " +
+           (first ? std::to_string(*first) : "no pair"));
+  }
+  if (split.pairRows(515) != 256u || split.pairRows(1000) != 512u || split.pairRows(kShort) != kShort / 2 ||
+      split.pairRows(AneFfn::kMaximumRows) != kShort)
+    fail("tiers: 515, 1000, 1024 or 2048 rows do not split as 256, 512, 512 and 1024 first");
+  section("tiers: a short tier's chunks and the other's within int8's error, verify() of both, and each one's pairs");
 }
 
 // A pair: two chunks' layers in turn in one command, each chunk's join left until the other chunk's FFN is added, as
@@ -910,6 +948,7 @@ void split(MetalBackend &backend) {
   split(backend, linear, gguf, buffers);
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
+  tiers(backend, linear, mlx, buffers);
   pair(backend, linear, mlx);
   quietRows(backend, linear, mlx, buffers);
   massiveChannel(backend, linear, buffers);

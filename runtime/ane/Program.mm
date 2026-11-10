@@ -433,17 +433,28 @@ Surface Surface::create(metal::MetalBackend &backend, uint32_t rows, uint32_t wi
   return result;
 }
 
-std::vector<uint8_t> constantBlob(std::span<const _Float16> values) {
-  constexpr uint64_t kData = 128;
-  std::vector<uint8_t> blob(kData + values.size_bytes());
-  const auto put = [&](uint64_t offset, auto value) { std::memcpy(blob.data() + offset, &value, sizeof value); };
-  put(0, uint32_t{1}); // blobs
-  put(4, uint32_t{2}); // storage version
-  put(kConstantOffset, uint32_t{0xdeadbeef}); // the record's sentinel
-  put(kConstantOffset + 4, uint32_t{1});      // fp16
-  put(kConstantOffset + 8, uint64_t{values.size_bytes()});
-  put(kConstantOffset + 16, kData);
-  std::memcpy(blob.data() + kData, values.data(), values.size_bytes());
+// A record of 64 bytes before each tensor's values, each record on a multiple
+// of 64 bytes.
+ConstantBlob constantBlob(std::span<const std::vector<_Float16>> tensors) {
+  constexpr uint64_t kRecord = 64;
+  ConstantBlob blob;
+  uint64_t size = kConstantOffset;
+  for (const std::vector<_Float16> &values : tensors) {
+    blob.offsets.push_back(size);
+    size += kRecord + (values.size() * sizeof(_Float16) + kRecord - 1) / kRecord * kRecord;
+  }
+  blob.bytes.resize(size);
+  const auto put = [&](uint64_t offset, auto value) { std::memcpy(blob.bytes.data() + offset, &value, sizeof value); };
+  put(0, static_cast<uint32_t>(tensors.size())); // blobs
+  put(4, uint32_t{2});                           // storage version
+  for (size_t index = 0; index < tensors.size(); ++index) {
+    const uint64_t record = blob.offsets[index], bytes = tensors[index].size() * sizeof(_Float16);
+    put(record, uint32_t{0xdeadbeef}); // the record's sentinel
+    put(record + 4, uint32_t{1});      // fp16
+    put(record + 8, bytes);
+    put(record + 16, record + kRecord);
+    std::memcpy(blob.bytes.data() + record + kRecord, tensors[index].data(), bytes);
+  }
   return blob;
 }
 

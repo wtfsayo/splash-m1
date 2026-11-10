@@ -126,7 +126,7 @@ Timings Measurement::time() {
   timings.gpuAlone = layer(sampled, kCount, kRows);
   const auto measure = [&](double share) {
     const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows});
+    AneFfn split(backend_, sampled, aneUnits, 0, interrupted_, std::array{kRows});
     return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
                   layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
   };
@@ -137,14 +137,15 @@ Timings Measurement::time() {
 
 double Measurement::split(uint32_t aneUnits, double gpuAlone) {
   const std::vector<SwiGluProjections> sampled = this->sampled();
-  AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows});
+  AneFfn split(backend_, sampled, aneUnits, 0, interrupted_, std::array{kRows});
   return layer(sampled, kCount, kRows, &split, gpuAlone);
 }
 
 ChunkTimings Measurement::chunks(AneFfn &split) {
-  // The functions a single chunk runs: those below kMinimumRows run a pair's.
+  // The functions a single chunk runs, of the tier of the most rows: those
+  // below kMinimumRows run a pair's.
   std::vector<uint32_t> rows;
-  for (const AneFfn::Evaluation &evaluation : split.evaluations_)
+  for (const AneFfn::Evaluation &evaluation : split.tiers_.back().evaluations)
     if (evaluation.rows >= AneFfn::kMinimumRows) rows.push_back(evaluation.rows);
   // About kCommandRows rows of layers to a command, more layers of fewer rows.
   const auto count = [&](uint32_t chunk) {

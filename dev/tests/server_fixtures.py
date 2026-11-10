@@ -877,6 +877,7 @@ def main_args(**overrides):
             "disable_ane": False,
             "ane_ffn_share": None,
             "ane_ffn_minimum_rows": None,
+            "ane_ffn_short_share": None,
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,

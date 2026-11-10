@@ -108,8 +108,9 @@ struct Fake {
   std::optional<Calibration> stored, remembered;
   std::optional<uint32_t> recalled, rememberedMost;
   bool healthy = true;
-  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
-  uint32_t asked = 0, timings = 0;
+  // The calls the start made: of unavailable() and time(), and of prepare() with its arguments, the short tier's
+  // units apart.
+  uint32_t asked = 0, timings = 0, shortUnits = 0;
   std::optional<std::pair<uint32_t, bool>> prepared;
   std::vector<uint32_t> splitsTimed;
 
@@ -141,8 +142,9 @@ struct Fake {
       splitsTimed.push_back(aneUnits);
       return split(aneUnits);
     };
-    result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
+    result.prepare = [this](uint32_t aneUnits, uint32_t ofShortTier, bool timeChunks) {
       prepared = {aneUnits, timeChunks};
+      shortUnits = ofShortTier;
       return prepare(aneUnits, timeChunks);
     };
     result.recall = [this](uint32_t maxAneUnits) {
@@ -672,14 +674,21 @@ void testGivenShare() {
                                    " rows or more, 2.5% from the GPU alone on the Neural Engine's part"),
           "the given share did not run as given: " + started.log);
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
-  require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
+  require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more") &&
+              !fake.shortUnits,
           "the given least chunk did not run as given: " + started.log);
-  for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0},
-                                           AneFfnSetting::Given{0.2, ops::AneFfn::kMinimumRows - 1},
-                                           AneFfnSetting::Given{0.2, 2049}})
+  // A short share runs its nearest units in the short tier, within the same plan.
+  started = start(fake, {.given = AneFfnSetting::Given{0.2, 256, 0.1}});
+  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(7u, false) && fake.shortUnits == 3 &&
+              started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
+              has(started.log, "at the given share 0.21 (0.09 in commands of fewer than 1024 rows) for chunks of"),
+          "the given short share did not run as given: " + started.log);
+  for (const AneFfnSetting::Given given :
+       {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0}, AneFfnSetting::Given{0.2, ops::AneFfn::kMinimumRows - 1},
+        AneFfnSetting::Given{0.2, 2049}, AneFfnSetting::Given{0.2, 256, 0.2}, AneFfnSetting::Given{0.2, 256, 0.5}})
     rejects([&] { static_cast<void>(start(fake, {.given = given})); }, "ANE FFN",
             "a given split of share " + std::to_string(given.share) + " from " + std::to_string(given.minimumRows) +
-                " rows ran");
+                " rows with short share " + std::to_string(given.shortShare) + " ran");
   // A dev tool's options: none calibrates, a share of 0 runs the GPU alone, and least rows need a share.
   const AneFfnSetting calibrated = AneFfnSetting::fromGiven(std::nullopt, std::nullopt),
                       off = AneFfnSetting::fromGiven(0.0, 832), given = AneFfnSetting::fromGiven(0.3, 832);

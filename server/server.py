@@ -1195,6 +1195,8 @@ def _native_command(
         command.extend(("--ane-ffn-share", str(args.ane_ffn_share)))
     if args.ane_ffn_minimum_rows is not None and not args.disable_ane:
         command.extend(("--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)))
+    if args.ane_ffn_short_share is not None and not args.disable_ane:
+        command.extend(("--ane-ffn-short-share", str(args.ane_ffn_short_share)))
     if args.prefill_mode != "bounded":
         command.extend(("--prefill-mode", args.prefill_mode))
     elif prefill_bound_ms != serve_options.PREFILL_BOUND_DEFAULT_MS:

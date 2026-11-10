@@ -18,24 +18,29 @@ namespace splash::engine {
 // calibrating one.
 struct AneFfnSetting final {
   // The ANE takes the whole channel units nearest `share` of them
-  // (ops::ane_ffn::nearestUnits), over chunks of `minimumRows` rows or more.
-  // A given share without its least chunk keeps 256 rows, where the program
-  // started before its 128-row functions: Macs whose split loses below that
-  // (M1 Max, M2 Max) keep their given split, and smaller chunks take it only
-  // as calibration or --ane-ffn-minimum-rows chooses.
+  // (ops::ane_ffn::nearestUnits), over chunks of `minimumRows` rows or more,
+  // and those nearest `shortShare` of them, when given, in its short tier's
+  // commands (ops::AneFfn::kShortRows). A given share without its least chunk
+  // keeps 256 rows, where the program started before its 128-row functions:
+  // Macs whose split loses below that (M1 Max, M2 Max) keep their given
+  // split, and smaller chunks take it only as calibration or
+  // --ane-ffn-minimum-rows chooses.
   static constexpr uint32_t kGivenMinimumRows = 256;
   static_assert(kGivenMinimumRows >= ops::AneFfn::kMinimumRows && kGivenMinimumRows <= ops::AneFfn::kMaximumRows);
   struct Given final {
     double share = 0.0;
     uint32_t minimumRows = kGivenMinimumRows;
+    double shortShare = 0.0;
   };
   bool enabled = true;
   std::optional<Given> given;
 
-  // The setting of a dev tool's --ane-ffn-share and --ane-ffn-minimum-rows:
-  // none calibrates the split, and a share of 0 runs the GPU alone. Throws
-  // for least rows without a share.
-  [[nodiscard]] static AneFfnSetting fromGiven(std::optional<double> share, std::optional<uint32_t> minimumRows);
+  // The setting of a dev tool's --ane-ffn-share, --ane-ffn-minimum-rows and
+  // --ane-ffn-short-share: no share calibrates the split, and a share of 0
+  // runs the GPU alone. Throws for least rows or a short share without a
+  // share.
+  [[nodiscard]] static AneFfnSetting fromGiven(std::optional<double> share, std::optional<uint32_t> minimumRows,
+                                               std::optional<double> shortShare = std::nullopt);
 };
 
 // The split of a model, prepared: the split, taking every chunk its
@@ -67,10 +72,11 @@ struct AneFfnModel final {
   // The split layer of full chunks with the ANE taking `aneUnits` units, less
   // the GPU alone's `gpuAlone` of time() (ops::ane_ffn::Measurement::split).
   std::function<double(uint32_t aneUnits, double gpuAlone)> timeSplit;
-  // The split that serves with the ANE taking `aneUnits`, verified, with its
+  // The split that serves with the ANE taking `aneUnits`, and `shortUnits`
+  // in its short tier's commands (0 for no such tier), verified, with its
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
   // model a test plays prepares no split.
-  std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
+  std::function<AneFfnPrepared(uint32_t aneUnits, uint32_t shortUnits, bool timeChunks)> prepare;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
   // is remembered; remembering one; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;

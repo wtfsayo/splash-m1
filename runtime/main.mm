@@ -233,7 +233,8 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn =
       arguments.neuralEngine
-          ? engine::AneFfnSetting::fromGiven(arguments.aneFfnShare, arguments.aneFfnMinimumRows)
+          ? engine::AneFfnSetting::fromGiven(arguments.aneFfnShare, arguments.aneFfnMinimumRows,
+                                             arguments.aneFfnShortShare)
           : engine::AneFfnSetting{.enabled = false};
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleMemory = arguments.pleMemory;

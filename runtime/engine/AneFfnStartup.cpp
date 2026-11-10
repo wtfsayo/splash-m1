@@ -106,6 +106,12 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
                         setting.given->minimumRows > ops::AneFfn::kMaximumRows))
     throw std::invalid_argument("ANE FFN split has no function of " + std::to_string(setting.given->minimumRows) +
                                 " rows");
+  // The given short tier's units, 0 for none.
+  const uint32_t shortUnits = setting.given && setting.given->shortShare > 0.0
+                                  ? ane_ffn::nearestUnits(setting.given->shortShare, model.units)
+                                  : 0;
+  if (given && shortUnits >= *given)
+    throw std::invalid_argument("ANE FFN split's short share takes fewer channels than its share");
 
   // Feasibility. The split's memory comes out of the KV cache, more of it
   // with each unit the ANE takes: the plan must still hold the context asked
@@ -178,15 +184,18 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     if (!plan.plan) throw std::logic_error("the memory plan does not hold the split it chose");
     std::ostringstream reason;
     reason << std::fixed << std::setprecision(2) << "at " << (given ? "the given share " : "share ")
-           << static_cast<double>(aneUnits) / model.units << " for chunks of " << minimumRows << " rows or more"
-           << timed << ", " << fixed(100.0 * prepared.error) << "% from the GPU alone on the Neural Engine's part ("
-           << how << " in " << seconds() << ")";
+           << static_cast<double>(aneUnits) / model.units;
+    if (shortUnits)
+      reason << " (" << static_cast<double>(shortUnits) / model.units << " in commands of fewer than "
+             << ops::AneFfn::kShortRows << " rows)";
+    reason << " for chunks of " << minimumRows << " rows or more" << timed << ", " << fixed(100.0 * prepared.error)
+           << "% from the GPU alone on the Neural Engine's part (" << how << " in " << seconds() << ")";
     return AneFfnStart{std::move(prepared.split), std::move(plan.plan),
                        {Kind::Split, reason.str(), automaticWith(aneUnits), without}};
   };
   try {
     if (given) {
-      AneFfnPrepared prepared = model.prepare(*given, false);
+      AneFfnPrepared prepared = model.prepare(*given, shortUnits, false);
       if (prepared.split) prepared.split->setMinimumRows(setting.given->minimumRows);
       return serve(std::move(prepared), *given, setting.given->minimumRows, "", "set up");
     }
@@ -216,7 +225,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
         return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, 0, false);
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -231,7 +240,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     // The fit's units, or a neighbour's that their timings show faster.
     const uint32_t chosen = ane_ffn::refine(
         *fitted, maxAneUnits, [&](uint32_t aneUnits) { return model.timeSplit(aneUnits, timings.gpuAlone); });
-    AneFfnPrepared prepared = model.prepare(chosen, true);
+    AneFfnPrepared prepared = model.prepare(chosen, 0, true);
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
     if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
@@ -275,13 +284,15 @@ std::string_view aneFfnOutcomeName(AneFfnOutcome::Kind kind) noexcept {
   return "unknown";
 }
 
-AneFfnSetting AneFfnSetting::fromGiven(std::optional<double> share, std::optional<uint32_t> minimumRows) {
+AneFfnSetting AneFfnSetting::fromGiven(std::optional<double> share, std::optional<uint32_t> minimumRows,
+                                       std::optional<double> shortShare) {
   if (!share) {
     if (minimumRows) throw std::invalid_argument("ANE FFN least chunk rows given without a share");
+    if (shortShare) throw std::invalid_argument("ANE FFN short share given without a share");
     return {};
   }
   if (*share == 0.0) return {.enabled = false};
-  return {.given = Given{*share, minimumRows.value_or(kGivenMinimumRows)}};
+  return {.given = Given{*share, minimumRows.value_or(kGivenMinimumRows), shortShare.value_or(0.0)}};
 }
 
 AneFfnStart startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, RequestedContext requested,

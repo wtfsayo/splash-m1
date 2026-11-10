@@ -42,10 +42,16 @@ struct Surface final {
   uint32_t strideBytes = 0;
 };
 
-// The weight blob of one fp16 constant tensor, which a program's MIL names as
-// BLOBFILE(path = string("@model_path/weights.bin"), offset = kConstantOffset).
+// The weight blob of a program's fp16 constant tensors, each of which its MIL
+// names as BLOBFILE(path = string("@model_path/weights.bin"), offset = its
+// offset): the first's is kConstantOffset.
 inline constexpr uint64_t kConstantOffset = 64;
-[[nodiscard]] std::vector<uint8_t> constantBlob(std::span<const _Float16> values);
+struct ConstantBlob final {
+  std::vector<uint8_t> bytes;
+  // By tensor.
+  std::vector<uint64_t> offsets;
+};
+[[nodiscard]] ConstantBlob constantBlob(std::span<const std::vector<_Float16>> tensors);
 
 // splash-ane in the per-user cache directory, where programs keep their
 // sources and recall() keeps what remember() wrote. Throws if macOS names no

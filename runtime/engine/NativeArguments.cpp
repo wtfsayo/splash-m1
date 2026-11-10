@@ -77,10 +77,11 @@ double parseDecodeShare(std::string_view value) {
   return result;
 }
 
-double parseAneFfnShare(std::string_view value) {
+// --ane-ffn-share and --ane-ffn-short-share.
+double parseAneFfnShare(std::string_view option, std::string_view value) {
   double result = 0.0;
   if (!parseFinite(value, result) || !(result >= 0.0 && result < 1.0))
-    throw UsageError("--ane-ffn-share requires a share in [0, 1)");
+    throw UsageError(std::string(option) + " requires a share in [0, 1)");
   return result;
 }
 
@@ -194,7 +195,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
     } else if (option == "--ane-ffn-share") {
-      result.aneFfnShare = parseAneFfnShare(value);
+      result.aneFfnShare = parseAneFfnShare(option, value);
+    } else if (option == "--ane-ffn-short-share") {
+      result.aneFfnShortShare = parseAneFfnShare(option, value);
     } else if (option == "--ane-ffn-minimum-rows") {
       uint32_t rows = 0;
       if (!parsePositive(value, rows))
@@ -236,6 +239,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (result.aneFfnMinimumRows && !result.aneFfnShare)
     throw UsageError("--ane-ffn-minimum-rows requires --ane-ffn-share");
+  if (result.aneFfnShortShare && !result.aneFfnShare)
+    throw UsageError("--ane-ffn-short-share requires --ane-ffn-share");
   if (result.aneFfnShare && !result.neuralEngine)
     throw UsageError("--ane-ffn-share requires --ane on");
   if (!result.cacheRoot.empty() && !result.persistentCache)

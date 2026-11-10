@@ -64,11 +64,13 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
-  // --ane-ffn-share SHARE and --ane-ffn-minimum-rows ROWS: the split's share
-  // and least chunk rows as given, none to calibrate them
-  // (AneFfnSetting::fromGiven); neither with --ane off.
+  // --ane-ffn-share SHARE, --ane-ffn-minimum-rows ROWS and
+  // --ane-ffn-short-share SHARE: the split's share, least chunk rows and
+  // short tier's share as given, no share to calibrate the split
+  // (AneFfnSetting::fromGiven); none with --ane off.
   std::optional<double> aneFfnShare;
   std::optional<uint32_t> aneFfnMinimumRows;
+  std::optional<double> aneFfnShortShare;
   // --prefill-mode bounded|full and --prefill-bound-ms: the isolated prefill
   // command bound (Scheduler.hpp), infinite for full.
   double prefillCommandMilliseconds = EngineConfig{}.prefillCommandMilliseconds;
